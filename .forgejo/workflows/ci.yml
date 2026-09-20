@@ -1,0 +1,106 @@
+# ==============================================================================
+# CI — Forgejo
+# ==============================================================================
+# The existence of THIS DIRECTORY is what stops Forgejo running
+# .github/workflows/ci.yml. Forgejo looks for .forgejo/workflows first and
+# only falls back to .github/workflows when that directory is absent — a fallback, not
+# a union. Before this file existed, the GitHub workflow ran on both forges,
+# and on this one it failed: see the `runs-on` note below.
+#
+# So the two files are not duplicates to keep in sync for tidiness. They are
+# one per forge, and deleting this one silently hands Forgejo the GitHub
+# file again.
+#
+# git.hu-tao.dev is the source of truth and GitHub is a push-only mirror, so
+# this is the run that actually gates the repo; the mirror's run is the
+# redundant one. Both exist because the mirror should stand on its own.
+#
+# COST. Every job here runs on the VPS that also serves mail, git and the
+# minecraft server. The runner's `cache:` is disabled and its `valid_volumes`
+# allow-list has no entry for a nix store, so nothing is reused between runs:
+# each one rebuilds the `.#ci` shell from the binary cache. Nix itself is no
+# longer part of that bill — it is in the image — but the shell still is, which
+# is the reason for a single job rather than the two the GitHub file uses.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Format, lint and evaluate
+    # Declared in modules/containers/forgejo-runner.nix as
+    # `nix:docker://nixos/nix:2.35.2`, and NOT ubuntu-latest. That label is
+    # node:22-bookworm, which has no `sudo` — and cachix/install-nix-action
+    # shells out to sudo unconditionally when it takes its non-systemd branch
+    # (install-nix.sh lines 91-93), so every run died at exit 127 before a
+    # single check ran. An image that already contains Nix removes the action,
+    # the sudo, and a ~50MB download per run all at once.
+    runs-on: nix
+
+    env:
+      NIX_CONFIG: experimental-features = nix-command flakes
+      GIT_TERMINAL_PROMPT: "0"
+
+    steps:
+      # actions/checkout's replacement — see the `runs-on` note for why it
+      # cannot be the action. Not a downgrade: the action's whole job here was
+      # a full clone (it was configured `fetch-depth: 0`), because pre-commit
+      # scans commits and a shallow clone would scan almost nothing.
+      #
+      # THE FETCH MUST BE AUTHENTICATED. This repository is private, and it is
+      # the only private one on the instance — every other repo here does the
+      # same hand-written checkout anonymously and is fine, which is exactly
+      # why this step is easy to copy wrong. An anonymous git gets HTTP 401,
+      # falls back to asking who you are, and GIT_TERMINAL_PROMPT=0 turns that
+      # prompt into:
+      #
+      #   fatal: could not read Username for 'https://git.hu-tao.dev':
+      #   terminal prompts disabled
+      #   [runner]: exitcode '128': failure
+      #
+      # Forgejo injects a repo-scoped token into every step as $GITHUB_TOKEN
+      # (and $FORGEJO_TOKEN — the GITHUB_* spellings are compatibility
+      # aliases). It is read from the environment rather than interpolated as
+      # ${{ secrets.GITHUB_TOKEN }} so the value never becomes part of the
+      # script text. x-access-token as the user part is the form
+      # actions/checkout uses, and Forgejo ships that action unmodified.
+      #
+      # Only the fetch carries the token; `origin` is added without it, so
+      # nothing sensitive is written to .git/config for a later step to read.
+      #
+      # Everything below is plain shell against the injected environment
+      # rather than ${{ }} expressions. Forgejo substitutes those before the
+      # shell ever runs, which makes the step impossible to dry-run outside
+      # CI; $GITHUB_SERVER_URL and $GITHUB_REPOSITORY carry the same values.
+      - name: Checkout
+        run: |
+          if [ -z "$GITHUB_TOKEN" ]; then
+            echo "::error::GITHUB_TOKEN is empty - a private repo cannot be fetched anonymously"
+            exit 1
+          fi
+          git init -q -b main .
+          git remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
+          git fetch -q --prune \
+            "https://x-access-token:$GITHUB_TOKEN@${GITHUB_SERVER_URL#https://}/$GITHUB_REPOSITORY" \
+            "+refs/heads/*:refs/remotes/origin/*" \
+            "+refs/pull/*:refs/pull/*"
+          git checkout -q --detach "$GITHUB_SHA"
+
+      # The same file the local commit hook uses, so a green CI means a clean
+      # `pre-commit run --all-files` on the developer's machine and vice versa.
+      - name: pre-commit
+        run: nix develop .#ci -c pre-commit run --all-files --show-diff-on-failure
+
+      # nix flake check is also run locally via `nix flake check`.
+      # The --no-build flag keeps this fast — it evaluates everything
+      # without compiling anything.
+      - name: nix flake check
+        run: nix flake check --no-build --print-build-logs
