@@ -36,63 +36,63 @@ concurrency:
 jobs:
   check:
     name: Format, lint and evaluate
-    # Declared in modules/containers/forgejo-runner.nix as
-    # `nix:docker://nixos/nix:2.35.2`, and NOT ubuntu-latest. That label is
-    # node:22-bookworm, which has no `sudo` — and cachix/install-nix-action
-    # shells out to sudo unconditionally when it takes its non-systemd branch
-    # (install-nix.sh lines 91-93), so every run died at exit 127 before a
-    # single check ran. An image that already contains Nix removes the action,
-    # the sudo, and a ~50MB download per run all at once.
-    runs-on: nix
+    # `nix-node`, declared in the vps repo's modules/runner/ci-image.nix, and
+    # NOT any of the other four labels this runner offers:
+    #
+    #   ubuntu-latest / node-22  node:22-bookworm — has node, has no nix, and
+    #                            has no `sudo`, which cachix/install-nix-action
+    #                            shells out to unconditionally on its
+    #                            non-systemd branch. Every run died at exit 127
+    #                            before a single check ran.
+    #   nix                      nixos/nix — has nix, has no node. Every
+    #                            JavaScript action is executed by a node binary
+    #                            inside the job container, so `uses:` cannot run
+    #                            there at all and the checkout has to be a
+    #                            hand-written `git fetch`.
+    #   nix-node                 both. Which is what lets this file use
+    #                            actions/checkout below.
+    runs-on: nix-node
 
     env:
-      NIX_CONFIG: experimental-features = nix-command flakes
+      # NIX_CONFIG is deliberately absent: the nix-node image bakes
+      # `experimental-features = nix-command flakes` into its /etc/nix/nix.conf,
+      # asserted by tests/ci-image.nix in the vps repo. Re-declaring it here
+      # would be a second copy to keep in step with the image.
+      #
+      # GIT_TERMINAL_PROMPT stays. actions/checkout authenticates, so nothing
+      # should ever prompt — but if that ever regresses, a prompt in a
+      # non-interactive container is a hang that burns the job's full 30m
+      # timeout, and this turns it into an immediate, readable failure.
       GIT_TERMINAL_PROMPT: "0"
 
     steps:
-      # actions/checkout's replacement — see the `runs-on` note for why it
-      # cannot be the action. Not a downgrade: the action's whole job here was
-      # a full clone (it was configured `fetch-depth: 0`), because pre-commit
-      # scans commits and a shallow clone would scan almost nothing.
-      #
-      # THE FETCH MUST BE AUTHENTICATED. This repository is private, and it is
-      # the only private one on the instance — every other repo here does the
-      # same hand-written checkout anonymously and is fine, which is exactly
-      # why this step is easy to copy wrong. An anonymous git gets HTTP 401,
-      # falls back to asking who you are, and GIT_TERMINAL_PROMPT=0 turns that
-      # prompt into:
+      # The action, not a hand-written `git fetch`. This repository is private,
+      # and the checkout is where that used to matter: a hand-written fetch is
+      # anonymous unless the author threads the job token through it, an
+      # anonymous fetch works fine on a public repo, and so the omission was
+      # invisible on every other repo on this instance and fatal here —
       #
       #   fatal: could not read Username for 'https://git.hu-tao.dev':
       #   terminal prompts disabled
       #   [runner]: exitcode '128': failure
       #
-      # Forgejo injects a repo-scoped token into every step as $GITHUB_TOKEN
-      # (and $FORGEJO_TOKEN — the GITHUB_* spellings are compatibility
-      # aliases). It is read from the environment rather than interpolated as
-      # ${{ secrets.GITHUB_TOKEN }} so the value never becomes part of the
-      # script text. x-access-token as the user part is the form
-      # actions/checkout uses, and Forgejo ships that action unmodified.
+      # actions/checkout defaults its `token` input to the token Forgejo
+      # injects, so the private case needs nothing from this file at all.
       #
-      # Only the fetch carries the token; `origin` is added without it, so
-      # nothing sensitive is written to .git/config for a later step to read.
+      # The bare `actions/checkout` form resolves against DEFAULT_ACTIONS_URL,
+      # unset on this instance and therefore Forgejo's own default of
+      # https://code.forgejo.org — which carries a synced mirror of the
+      # upstream action. Pinned to the same tag .github/workflows/ci.yml uses,
+      # so both forges run identical checkout logic.
       #
-      # Everything below is plain shell against the injected environment
-      # rather than ${{ }} expressions. Forgejo substitutes those before the
-      # shell ever runs, which makes the step impossible to dry-run outside
-      # CI; $GITHUB_SERVER_URL and $GITHUB_REPOSITORY carry the same values.
+      # No fetch-depth. The default shallow clone is enough because nothing
+      # here reads history: the hooks are the LaTeX compile, markdownlint,
+      # nixfmt and statix, and all four work on the checked-out tree. The old
+      # hand-written fetch pulled every branch and PR ref because it was
+      # copied from the vps repo, where gitleaks scans commits — a cost this
+      # repo was paying for a hook it does not have.
       - name: Checkout
-        run: |
-          if [ -z "$GITHUB_TOKEN" ]; then
-            echo "::error::GITHUB_TOKEN is empty - a private repo cannot be fetched anonymously"
-            exit 1
-          fi
-          git init -q -b main .
-          git remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
-          git fetch -q --prune \
-            "https://x-access-token:$GITHUB_TOKEN@${GITHUB_SERVER_URL#https://}/$GITHUB_REPOSITORY" \
-            "+refs/heads/*:refs/remotes/origin/*" \
-            "+refs/pull/*:refs/pull/*"
-          git checkout -q --detach "$GITHUB_SHA"
+        uses: actions/checkout@v7.0.1
 
       # The same file the local commit hook uses, so a green CI means a clean
       # `pre-commit run --all-files` on the developer's machine and vice versa.
