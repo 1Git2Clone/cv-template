@@ -10,7 +10,7 @@ tracking system can actually read.
 
 ```text
 PROFILE.md  ──┐
-               ├──►  tailored cv.tex  ──►  latexmk  ──►  cv.pdf
+              ├──►  tailored cv.tex  ──►  latexmk  ──►  cv.pdf
 job posting ──┘
 ```
 
